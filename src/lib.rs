@@ -1,3 +1,4 @@
+extern crate pav_regression;
 
 use log::{info};
 

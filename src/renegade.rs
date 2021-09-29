@@ -2,21 +2,43 @@ pub struct Renegade {
 
 } 
 
-pub trait MetricExtractor<I> {
-    fn distance(input_a : I, input_b : I) -> f64;
+pub trait Labelled {
+    fn label(&self) -> &str;
 }
 
-pub trait Row<I, O> {
-    fn input() -> I;
-    fn output() -> O;
+pub trait Metric<InputType> {
+    fn distance(&self, input_a : InputType, input_b : InputType) -> f64;
+}
+
+pub trait Row<InputType, OutputType> {
+    fn input(&self) -> InputType;
+    fn output(&self) -> OutputType;
 }
 
 impl Renegade {
-    pub fn new<I, O, TI, T>(trainingData : T) -> Renegade 
+    pub fn new<InputType, OutputType, InstanceType, TrainingDataType, MetricType>(
+        training_data : TrainingDataType, 
+        input_metrics : Vec<Box<MetricType>>,
+        output_metric : Box<dyn Metric<OutputType>>,    
+    ) -> Renegade 
     where 
-     TI : Row<I, O>,
-     T : IntoIterator<Item = TI>
-    {
+     InstanceType : Row<InputType, OutputType>,
+     TrainingDataType : IntoIterator<Item = InstanceType>,
+     MetricType : Metric<InputType> + Labelled, {
+         
         Renegade {}
+    }
+
+    pub fn learn_metrics<InputType, OutputType, InstanceType, TrainingDataType, MetricType>(
+        training_data : TrainingDataType, 
+        input_metrics : Vec<Box<MetricType>>,
+        output_metric : Box<dyn Metric<OutputType>>,    
+    ) -> MetricType 
+    where 
+     InstanceType : Row<InputType, OutputType>,
+     TrainingDataType : IntoIterator<Item = InstanceType>,
+     MetricType : Metric<InputType> + Labelled, {
+         
+        todo!()
     }
 }
