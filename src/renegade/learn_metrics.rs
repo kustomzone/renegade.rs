@@ -15,7 +15,7 @@ pub(crate) fn learn_metrics<InputType, OutputType, MetricType>(
 where
     InputType: Copy,
     OutputType: Copy,
-    MetricType: Metric<InputType> + Labelled + Sync,
+    MetricType: Metric<InputType> + Sync,
 {
     let mut rng = thread_rng();
 
@@ -60,7 +60,7 @@ fn sample_distances<InputType, OutputType, MetricType>(
 where
     InputType: Copy,
     OutputType: Copy,
-    MetricType: Metric<InputType> + Labelled + Sync,
+    MetricType: Metric<InputType> + Sync,
 {
     assert!(sample_count < training_data.len() * (training_data.len() - 1));
 
@@ -189,4 +189,47 @@ fn test_regressions(
         .sum();
     let rmse = (sum_error_squared / distance_samples.len() as f64).sqrt();
     rmse
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::{thread_rng, Rng};
+
+    use crate::renegade::learn_metrics::*;
+
+    
+
+    #[test]
+    fn split_train_test_test() {
+        let mut rng = thread_rng();
+        let data = {
+            let rng: &mut ThreadRng = &mut rng;
+            let mut data : Vec<(f64, f64)> = vec![];
+            for _ in 0 .. 100 {
+                data.push((rng.gen(), rng.gen()));
+            }
+            data
+        };
+        let (train, test) : (Vec<(f64, f64)>, Vec<(f64, f64)>)= split_train_test(&mut rng, 0.5, &data);
+        assert!((35 .. 55).contains(&train.len()));
+        assert!((35 .. 55).contains(&test.len()));
+        assert!(train.len() + test.len() == 100);
+    }
+
+    #[test]
+    fn sample_distances_test() {
+        let mut rng = thread_rng();
+        let data = {
+            let rng: &mut ThreadRng = &mut rng;
+            let mut data : Vec<((f64, f64), f64)> = vec![];
+            for _ in 0 .. 100 {
+                let a: f64 = rng.gen_range(0.0 .. 1.0);
+                let b: f64 = rng.gen_range(0.0 .. 1.0);
+
+                data.push(((a, b), a*b));
+            }
+            data
+        };
+
+    }
 }

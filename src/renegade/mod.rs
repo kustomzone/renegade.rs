@@ -1,6 +1,6 @@
 mod learn_metrics;
 
-use pav_regression::pav::{IsotonicRegression};
+use pav_regression::pav::IsotonicRegression;
 
 pub fn build_model<InputType, OutputType, MetricType>(
     data: &Vec<(InputType, OutputType)>,
