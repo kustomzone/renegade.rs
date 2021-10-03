@@ -1,5 +1,6 @@
 use pav_regression::pav::{IsotonicRegression, Point};
-use rand::Rng;
+use rand::prelude::ThreadRng;
+use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use std::cell::*;
 use std::sync::RwLock;
@@ -13,29 +14,70 @@ pub trait Metric<InputType> {
 }
 
 pub trait Learner {
-    type InputType;
-    type OutputType;
+    type InputType: Copy;
+    type OutputType: Copy;
     type MetricType: Metric<Self::InputType> + Labelled + Sync;
 
     fn learn_metrics(
-        training_data: &Vec<(Self::InputType, Self::OutputType)>,
+        data: &Vec<(Self::InputType, Self::OutputType)>,
         input_metrics: &Vec<Box<Self::MetricType>>,
         output_metric: &Box<dyn Metric<Self::OutputType>>,
         config: &LearnerConfig,
     ) -> Self::MetricType {
-        let distance_samples = Self::sample_distances(
-            training_data,
+        let mut rng = thread_rng();
+
+        let (training_data, testing_data) =
+            Self::split_train_test(rng, config.train_test_prop, data);
+
+        let training_samples = Self::sample_distances(
+            &mut rng,
+            &training_data,
             input_metrics,
             output_metric,
             config.sample_count,
         );
+        let testing_samples = Self::sample_distances(
+            &mut rng,
+            &testing_data,
+            input_metrics,
+            output_metric,
+            config.sample_count,
+        );
+
         let mut initial_regressions =
-            RwLock::new(Self::create_initial_regressions(distance_samples));
+            RwLock::new(Self::create_initial_regressions(training_samples));
+
+        for iteration in 0..config.iterations {
+            
+        }
 
         todo!();
     }
 
+    fn split_train_test(
+        rng: &mut ThreadRng,
+        train_test_prop: f64,
+        data: &Vec<(Self::InputType, Self::OutputType)>,
+    ) -> (
+        Vec<(Self::InputType, Self::OutputType)>,
+        Vec<(Self::InputType, Self::OutputType)>,
+    ) {
+        let mut training_data: Vec<(Self::InputType, Self::OutputType)> = vec![];
+        let mut testing_data: Vec<(Self::InputType, Self::OutputType)> = vec![];
+
+        for &d in data {
+            if rng.gen_bool(train_test_prop) {
+                training_data.push(d);
+            } else {
+                testing_data.push(d);
+            }
+        }
+
+        (training_data, testing_data)
+    }
+
     fn sample_distances(
+        rng: &mut ThreadRng,
         training_data: &Vec<(Self::InputType, Self::OutputType)>,
         input_metrics: &Vec<Box<Self::MetricType>>,
         output_metric: &Box<dyn Metric<Self::OutputType>>,
@@ -43,7 +85,6 @@ pub trait Learner {
     ) -> Vec<(Vec<f64>, f64)> {
         assert!(sample_count < training_data.len() * (training_data.len() - 1));
 
-        let mut rng = rand::thread_rng();
         let mut samples: Vec<(Vec<f64>, f64)> = vec![];
         while samples.len() < sample_count {
             let a_ix = rng.gen_range(0..training_data.len());
@@ -81,10 +122,31 @@ pub trait Learner {
             .collect()
     }
 
-    fn refine_regressions(
+    fn test_regressions(
         distance_samples: Vec<(Vec<f64>, f64)>,
         regressions: RwLock<Vec<IsotonicRegression>>,
     ) -> f64 {
+        let reg = regressions.read().unwrap();
+        let sum_error_squared: f64 = distance_samples
+            .par_iter()
+            .map(|(input_distances, output_distance)| {
+                let prediction = input_distances
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, input_dist)| reg[ix].interpolate(input_dist))
+                    .sum::<f64>();
+                let error = prediction - output_distance;
+                error * error
+            })
+            .sum();
+        let rmse = (sum_error_squared / distance_samples.len() as f64).sqrt();
+        rmse
+    }
+
+    fn refine_regressions(
+        distance_samples: Vec<(Vec<f64>, f64)>,
+        regressions: RwLock<Vec<IsotonicRegression>>,
+    ) {
         let point_vectors = Self::calculate_point_vectors(&distance_samples, &regressions);
         let refined_regressions: Vec<IsotonicRegression> = point_vectors
             .read()
@@ -95,8 +157,6 @@ pub trait Learner {
 
         let mut writable_regressions = regressions.write().unwrap();
         *writable_regressions = refined_regressions;
-
-        todo!();
     }
 
     fn calculate_point_vectors(
@@ -132,4 +192,22 @@ pub trait Learner {
 
 pub struct LearnerConfig {
     sample_count: usize,
+    train_test_prop: f64,
+    iterations: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn sample_distances_test() {
+        let mut rng = thread_rng();
+
+
+    }
+
+    fn generate_training_data(size : u32, rng : &mut ThreadRng) {
+        
+    }
 }
