@@ -46,6 +46,29 @@ where
     regressions
 }
 
+fn split_train_test<InputType, OutputType>(
+    rng: &mut ThreadRng,
+    train_test_prop: f64,
+    data: &Vec<(InputType, OutputType)>,
+) -> (Vec<(InputType, OutputType)>, Vec<(InputType, OutputType)>)
+where
+    InputType: Copy,
+    OutputType: Copy,
+{
+    let mut training_data: Vec<(InputType, OutputType)> = vec![];
+    let mut testing_data: Vec<(InputType, OutputType)> = vec![];
+
+    for &d in data {
+        if rng.gen_bool(train_test_prop) {
+            training_data.push(d);
+        } else {
+            testing_data.push(d);
+        }
+    }
+
+    (training_data, testing_data)
+}
+
 fn sample_distances<InputType, OutputType>(
     rng: &mut ThreadRng,
     training_data: &Vec<(InputType, OutputType)>,
@@ -73,6 +96,23 @@ where
     }
     samples
 }
+
+fn create_initial_regressions(distance_samples: &Vec<(Vec<f64>, f64)>) -> Vec<IsotonicRegression> {
+    let num_inputs = distance_samples.first().unwrap().0.len();
+    let mut points : Vec<Vec<Point>> = vec![vec![]; num_inputs];
+    for (input_distances, output_distance) in distance_samples {
+            for (ix, input_dist) in input_distances.iter().enumerate() {
+                let point = Point::new(
+                    *input_dist,
+                    output_distance / num_inputs as f64,
+                );
+                points[ix].push(point);
+            }
+        }
+    points.par_iter().map(|points| {IsotonicRegression::new_ascending(points)}).collect()
+    
+}
+
 
 fn calculate_point_vectors(
     distance_samples: &Vec<(Vec<f64>, f64)>,
@@ -104,23 +144,6 @@ fn calculate_point_vectors(
     point_vectors
 }
 
-fn create_initial_regressions(distance_samples: &Vec<(Vec<f64>, f64)>) -> Vec<IsotonicRegression> {
-    let num_input_metrics = distance_samples.first().unwrap().0.len();
-    distance_samples
-        .par_iter()
-        .map(|(input_distances, output_distance)| {
-            let mut points: Vec<Point> = vec![];
-            for input_dist in input_distances {
-                points.push(Point::new(
-                    *input_dist,
-                    output_distance / num_input_metrics as f64,
-                ));
-            }
-            IsotonicRegression::new_ascending(&points)
-        })
-        .collect()
-}
-
 fn refine_regressions(
     distance_samples: &Vec<(Vec<f64>, f64)>,
     regressions: &mut RwLock<Vec<IsotonicRegression>>,
@@ -135,29 +158,6 @@ fn refine_regressions(
 
     let mut writable_regressions = regressions.write().unwrap();
     *writable_regressions = refined_regressions;
-}
-
-fn split_train_test<InputType, OutputType>(
-    rng: &mut ThreadRng,
-    train_test_prop: f64,
-    data: &Vec<(InputType, OutputType)>,
-) -> (Vec<(InputType, OutputType)>, Vec<(InputType, OutputType)>)
-where
-    InputType: Copy,
-    OutputType: Copy,
-{
-    let mut training_data: Vec<(InputType, OutputType)> = vec![];
-    let mut testing_data: Vec<(InputType, OutputType)> = vec![];
-
-    for &d in data {
-        if rng.gen_bool(train_test_prop) {
-            training_data.push(d);
-        } else {
-            testing_data.push(d);
-        }
-    }
-
-    (training_data, testing_data)
 }
 
 fn test_regressions(
@@ -184,20 +184,14 @@ fn test_regressions(
 #[cfg(test)]
 mod tests {
     use rand::{thread_rng, Rng};
+    use rayon::iter::Interleave;
 
     use crate::renegade::learn_metrics::*;
 
     #[test]
     fn split_train_test_test() {
         let mut rng = thread_rng();
-        let data = {
-            let rng: &mut ThreadRng = &mut rng;
-            let mut data: Vec<(f64, f64)> = vec![];
-            for _ in 0..100 {
-                data.push((rng.gen(), rng.gen()));
-            }
-            data
-        };
+        let data = gen_simple_data(&mut rng);
         let (train, test): (Vec<(f64, f64)>, Vec<(f64, f64)>) =
             split_train_test(&mut rng, 0.5, &data);
         assert!((35..55).contains(&train.len()));
@@ -208,22 +202,57 @@ mod tests {
     #[test]
     fn sample_distances_test() {
         let mut rng = thread_rng();
-        let data = {
-            let rng: &mut ThreadRng = &mut rng;
-            let mut data: Vec<((f64, f64), f64)> = vec![];
-            for _ in 0..100 {
-                let a: f64 = rng.gen_range(0.0..1.0);
-                let b: f64 = rng.gen_range(0.0..1.0);
+        let data = gen_simple_data(&mut rng);
 
-                data.push(((a, b), a * b));
-            }
-            data
-        };
+        let samples = sample_distances(
+            &mut rng,
+            &data,
+            float_input_metric,
+            float_output_metric,
+            100,
+        );
+
+        assert_eq!(samples.len(), 100);
+        for sample in samples {
+            assert_eq!(sample.0[0], sample.1);
+        }
     }
 
-    impl Metric<(f64, f64)> for (f64, f64) {
-        fn distance(&self, input_a: &(f64, f64), input_b: &(f64, f64)) -> f64 {
-            todo!()
+    #[test]
+    fn create_initial_regressions_test() {
+        let mut rng = thread_rng();
+        let data = gen_simple_data(&mut rng);
+
+        let samples = sample_distances(
+            &mut rng,
+            &data,
+            float_input_metric,
+            float_output_metric,
+            100,
+        );
+        let initial_regressions = create_initial_regressions(&samples);
+        assert_eq!(initial_regressions.len(), 1);
+
+        for point in initial_regressions[0].get_points() {
+            assert_eq!(point.x(), point.y());
         }
+
+    }
+
+    fn float_input_metric(a: &f64, b: &f64) -> Vec<f64> {
+        vec![(a - b).abs()]
+    }
+
+    fn float_output_metric(a: &f64, b: &f64) -> f64 {
+        (a - b).abs()
+    }
+
+    fn gen_simple_data(rng: &mut ThreadRng) -> Vec<(f64, f64)> {
+        let mut data: Vec<(f64, f64)> = vec![];
+        for _ in 0..100 {
+            let v = rng.gen_range(0.0 .. 1.0);
+            data.push((v, v));
+        }
+        data
     }
 }
