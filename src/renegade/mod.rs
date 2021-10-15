@@ -4,7 +4,7 @@ mod waypoint_index;
 use pav_regression::pav::IsotonicRegression;
 
 pub fn build_model<InputType, OutputType>(
-    data: &Vec<(InputType, OutputType)>,    
+    data: &Vec<(InputType, OutputType)>,
     input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
     output_metric: fn(&OutputType, &OutputType) -> f64,
     config: &LearnerConfig,

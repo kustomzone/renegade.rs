@@ -99,20 +99,18 @@ where
 
 fn create_initial_regressions(distance_samples: &Vec<(Vec<f64>, f64)>) -> Vec<IsotonicRegression> {
     let num_inputs = distance_samples.first().unwrap().0.len();
-    let mut points : Vec<Vec<Point>> = vec![vec![]; num_inputs];
+    let mut points: Vec<Vec<Point>> = vec![vec![]; num_inputs];
     for (input_distances, output_distance) in distance_samples {
-            for (ix, input_dist) in input_distances.iter().enumerate() {
-                let point = Point::new(
-                    *input_dist,
-                    output_distance / num_inputs as f64,
-                );
-                points[ix].push(point);
-            }
+        for (ix, input_dist) in input_distances.iter().enumerate() {
+            let point = Point::new(*input_dist, output_distance / num_inputs as f64);
+            points[ix].push(point);
         }
-    points.par_iter().map(|points| {IsotonicRegression::new_ascending(points)}).collect()
-    
+    }
+    points
+        .par_iter()
+        .map(|points| IsotonicRegression::new_ascending(points))
+        .collect()
 }
-
 
 fn calculate_point_vectors(
     distance_samples: &Vec<(Vec<f64>, f64)>,
@@ -237,7 +235,6 @@ mod tests {
             // Verify that input and output distances are the same
             assert_eq!(point.x(), point.y());
         }
-
     }
 
     fn float_input_metric(a: &f64, b: &f64) -> Vec<f64> {
@@ -251,7 +248,7 @@ mod tests {
     fn gen_simple_data(rng: &mut ThreadRng) -> Vec<(f64, f64)> {
         let mut data: Vec<(f64, f64)> = vec![];
         for _ in 0..100 {
-            let v = rng.gen_range(0.0 .. 1.0);
+            let v = rng.gen_range(0.0..1.0);
             data.push((v, v));
         }
         data
