@@ -1,5 +1,5 @@
-mod learn_metrics;
-mod waypoint_index;
+pub mod learn_metrics;
+pub mod waypoint_index;
 
 use pav_regression::pav::IsotonicRegression;
 

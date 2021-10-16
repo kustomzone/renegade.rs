@@ -1,5 +1,5 @@
 use bit_vec::BitVec;
-use rand::prelude::{Rng, ThreadRng};
+use rand::prelude::*;
 
 #[derive(Clone)]
 pub struct WaypointIndex<I: Clone + PartialEq<I>> {
@@ -15,13 +15,16 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         sample_count: usize,
         rng: &mut ThreadRng,
     ) -> WaypointIndex<I> {
-        let samples = Self::sample(rng, data, sample_count);
+        let samples = data
+            .choose_multiple(rng, sample_count)
+            .map(|x| x.clone())
+            .collect();
 
         let mut waypoints: Vec<(I, I)> = vec![];
         let mut waypoint_samples: Vec<BitVec> = vec![BitVec::new(); waypoint_count];
         for _ in 0..waypoint_count {
             let mut first_best: Option<((I, I), f64, BitVec)> = Option::None;
-            for _ in 0..sample_count { // TODO: Parallelize
+            for _ in 0..sample_count {
                 let waypoint = Self::random_distance_pair(rng, data);
                 let correlations: BitVec = Self::calc_correlations(dist, &samples, &waypoint);
                 let score = Self::calc_score(&waypoint_samples, &correlations);
@@ -86,7 +89,10 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
             .map(|s| count_to_score(*s, correlations.len()))
             .min_by(|a, b| a.partial_cmp(b).unwrap());
 
-        separation_score.min(correlation_score.unwrap_or(0.0))
+        match correlation_score {
+            None => separation_score,
+            Some(cs) => cs.min(separation_score),
+        }
     }
 
     /// For a given waypoint determine which side of each sample it's on, results returned as BitVec
@@ -110,14 +116,6 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         vec[rng.gen_range(0..vec.len())].clone()
     }
 
-    fn sample(rng: &mut ThreadRng, data: &Vec<I>, sample_count: usize) -> Vec<I> {
-        assert!(data.len() > sample_count * 2);
-        let mut samples = vec![];
-        for _ in 0..sample_count {
-            samples.push(data[rng.gen_range(0..data.len())].clone());
-        }
-        samples
-    }
 }
 
 fn count_to_score(true_count: usize, total: usize) -> f64 {

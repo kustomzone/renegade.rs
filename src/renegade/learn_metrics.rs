@@ -6,7 +6,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::*;
 
-pub(crate) fn learn_metrics<InputType, OutputType>(
+pub fn learn_metrics<InputType, OutputType>(
     data: &Vec<(InputType, OutputType)>,
     input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
     output_metric: fn(&OutputType, &OutputType) -> f64,
@@ -182,7 +182,6 @@ fn test_regressions(
 #[cfg(test)]
 mod tests {
     use rand::{thread_rng, Rng};
-    use rayon::iter::Interleave;
 
     use crate::renegade::learn_metrics::*;
 
@@ -192,8 +191,8 @@ mod tests {
         let data = gen_simple_data(&mut rng);
         let (train, test): (Vec<(f64, f64)>, Vec<(f64, f64)>) =
             split_train_test(&mut rng, 0.5, &data);
-        assert!((35..55).contains(&train.len()));
-        assert!((35..55).contains(&test.len()));
+        assert!((20..70).contains(&train.len()));
+        assert!((20..70).contains(&test.len()));
         assert!(train.len() + test.len() == 100);
     }
 
