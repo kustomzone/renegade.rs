@@ -90,7 +90,7 @@ where
             let a = &training_data[a_ix];
             let b = &training_data[b_ix];
             let output_distance = output_metric(&a.1, &b.1);
-            let mut input_distances: Vec<f64> = input_metrics(&a.0, &b.0);
+            let input_distances: Vec<f64> = input_metrics(&a.0, &b.0);
             samples.push((input_distances, output_distance));
         }
     }

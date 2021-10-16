@@ -12,11 +12,12 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         data: &Vec<I>,
         dist: fn(&I, &I) -> f64,
         waypoint_count: usize,
-        sample_count: usize,
-        rng: &mut ThreadRng,
+        item_samples: usize,
+        waypoint_samples: usize,
     ) -> WaypointIndex<I> {
+        let mut rng = thread_rng();
         let samples = data
-            .choose_multiple(rng, sample_count)
+            .choose_multiple(&mut rng, item_samples)
             .map(|x| x.clone())
             .collect();
 
@@ -24,8 +25,8 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         let mut waypoint_samples: Vec<BitVec> = vec![BitVec::new(); waypoint_count];
         for _ in 0..waypoint_count {
             let mut first_best: Option<((I, I), f64, BitVec)> = Option::None;
-            for _ in 0..sample_count {
-                let waypoint_candidate = Self::random_distance_pair(rng, data);
+            for _ in 0..waypoint_samples {
+                let waypoint_candidate = Self::random_distance_pair(data);
                 let correlations: BitVec = Self::calc_sides(dist, &samples, &waypoint_candidate);
                 let score = calc_score(&waypoint_samples, &correlations);
                 if first_best.is_none() || first_best.as_ref().unwrap().1 < score {
@@ -57,7 +58,8 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         bv
     }
 
-    fn random_distance_pair(rng: &mut ThreadRng, vec: &Vec<I>) -> (I, I) {
+    fn random_distance_pair(vec: &Vec<I>) -> (I, I) {
+        let mut rng = thread_rng();
         loop {
             let a = vec[rng.gen_range(0..vec.len())].clone();
             let b = vec[rng.gen_range(0..vec.len())].clone();
@@ -83,11 +85,6 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         let d2 = (dist)(&waypoint.1, item);
         d1 < d2
     }
-
-    fn select_random(rng: &mut ThreadRng, vec: &Vec<I>) -> I {
-        vec[rng.gen_range(0..vec.len())].clone()
-    }
-
 }
 
 fn calc_score(correlations_by_waypoint: &Vec<BitVec>, target_correlations: &BitVec) -> f64 {
@@ -95,7 +92,7 @@ fn calc_score(correlations_by_waypoint: &Vec<BitVec>, target_correlations: &BitV
     for (waypoint_ix, waypoint_correlations) in correlations_by_waypoint.iter().enumerate() {
         for (sample_ix, target_cor) in target_correlations.iter().enumerate() {
             let sample_side_same_as_waypoint = !(waypoint_correlations[sample_ix] ^ target_cor);
-            if sample_side_same_as_waypoint { 
+            if sample_side_same_as_waypoint {
                 same_counts_by_waypoint[waypoint_ix] += 1;
             }
         }
@@ -130,9 +127,7 @@ mod tests {
     use crate::index::WaypointIndex;
 
     #[test]
-    fn calc_score_test() {
-
-    }
+    fn calc_score_test() {}
 
     #[test]
     fn calc_correlations_test() {
