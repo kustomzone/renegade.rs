@@ -29,10 +29,6 @@ impl DataPoint for NumericPoint {
     fn feature_values(&self) -> Vec<f64> {
         self.features.clone()
     }
-
-    fn num_features(&self) -> usize {
-        self.features.len()
-    }
 }
 
 struct SyntheticResult {
@@ -241,7 +237,7 @@ fn eval_dataset(
     is_classification: bool,
 ) -> SyntheticResult {
     let n = data.len();
-    let num_features = data[0].0.num_features();
+    let num_features = data[0].0.feature_values().len();
     let (no_metric_k5, _) = loo_eval(&data, is_classification, false, Some(5));
     let no_metric_auto_k = loo_eval(&data, is_classification, false, None);
     let with_metric_auto_k = loo_eval(&data, is_classification, true, None);

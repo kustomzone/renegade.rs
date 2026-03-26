@@ -6,7 +6,6 @@ description = "A nonparametric supervised learning library based on KNN"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-ordered-float = "4"
 pav_regression = "0.7"
 
 [dev-dependencies]

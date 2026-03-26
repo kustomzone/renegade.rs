@@ -38,8 +38,6 @@ impl DataPoint for MyPoint {
     fn feature_values(&self) -> Vec<f64> {
         vec![self.temperature, self.pressure, self.category as f64]
     }
-
-    fn num_features(&self) -> usize { 3 }
 }
 
 // Build and query

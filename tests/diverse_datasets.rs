@@ -27,10 +27,6 @@ impl DataPoint for CsvPoint {
     fn feature_values(&self) -> Vec<f64> {
         self.values.clone()
     }
-
-    fn num_features(&self) -> usize {
-        self.values.len()
-    }
 }
 
 /// Load a CSV where all columns are numeric, last column is target.

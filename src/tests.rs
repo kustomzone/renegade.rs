@@ -32,10 +32,6 @@ impl DataPoint for Point2D {
     fn feature_values(&self) -> Vec<f64> {
         vec![self.x, self.y]
     }
-
-    fn num_features(&self) -> usize {
-        2
-    }
 }
 
 /// Mixed numeric + categorical point for testing.
@@ -66,10 +62,6 @@ impl DataPoint for MixedPoint {
             _ => 0.5,
         };
         vec![self.value, cat_val]
-    }
-
-    fn num_features(&self) -> usize {
-        2
     }
 }
 
@@ -114,7 +106,7 @@ fn linear_function_extrapolation() {
     }
 
     // Query near origin — extrapolation should predict close to 0.
-    let pred = model.predict_k(&Point2D::new(0.0, 0.0, range, range), 20);
+    let pred = model.predict_k_extrapolated(&Point2D::new(0.0, 0.0, range, range), 20);
     assert!(
         pred.value.abs() < 5.0,
         "Expected prediction near 0, got {}",
@@ -211,7 +203,7 @@ fn r_squared_indicates_fit_quality() {
         model.add(Point2D::new(v, 0.0, range, range), v * 2.0);
     }
 
-    let pred = model.predict_k(&Point2D::new(0.0, 0.0, range, range), 10);
+    let pred = model.predict_k_extrapolated(&Point2D::new(0.0, 0.0, range, range), 10);
     assert!(
         pred.r_squared > 0.9,
         "Expected high R² for linear data, got {}",
@@ -228,7 +220,7 @@ fn small_dataset_still_works() {
     model.add(Point2D::new(9.0, 9.0, range, range), 90.0);
 
     // With only 2 points, should still give a prediction.
-    let pred = model.predict_k(&Point2D::new(0.0, 0.0, range, range), 2);
+    let pred = model.predict_k_extrapolated(&Point2D::new(0.0, 0.0, range, range), 2);
     assert!(!pred.value.is_nan());
     assert_eq!(pred.k, 2);
 }

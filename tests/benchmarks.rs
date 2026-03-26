@@ -20,10 +20,6 @@ impl DataPoint for IrisPoint {
     fn feature_values(&self) -> Vec<f64> {
         self.features.to_vec()
     }
-
-    fn num_features(&self) -> usize {
-        4
-    }
 }
 
 fn load_iris() -> Vec<(IrisPoint, f64)> {
@@ -84,10 +80,6 @@ impl DataPoint for WinePoint {
 
     fn feature_values(&self) -> Vec<f64> {
         self.features.to_vec()
-    }
-
-    fn num_features(&self) -> usize {
-        13
     }
 }
 
@@ -177,10 +169,6 @@ impl DataPoint for AutoMpgPoint {
             self.model_year,
             self.origin as f64,
         ]
-    }
-
-    fn num_features(&self) -> usize {
-        7
     }
 }
 
@@ -351,7 +339,7 @@ fn iris_extrapolation_sanity() {
         features: [5.0, 3.5, 1.4, 0.2],
         ranges: data[0].0.ranges,
     };
-    let pred = model.predict_k(&setosa_query, 10);
+    let pred = model.predict_k_extrapolated(&setosa_query, 10);
     eprintln!(
         "Setosa query: predicted={:.2}, r²={:.3}",
         pred.value, pred.r_squared

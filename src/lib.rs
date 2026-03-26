@@ -12,6 +12,10 @@ pub use predict::ExtrapolatedPrediction;
 /// - `feature_distances`: per-feature distances in [0, 1] (for base KNN)
 /// - `feature_values`: raw feature values (for metric learning)
 ///
+/// **Important**: Both methods must describe the same features in the same order.
+/// `feature_distances` returns pairwise distances while `feature_values` returns
+/// raw values, but they must correspond to the same underlying features.
+///
 /// For numeric features, distances are typically |a - b| / (max - min).
 /// For categorical features: 0.0 if same, 1.0 if different.
 /// Custom distance functions (edit distance, Jaccard, etc.) are fine as long as
@@ -24,9 +28,6 @@ pub trait DataPoint {
     /// Each feature should be a numeric value. For categorical features,
     /// use a numeric encoding (e.g., 0, 1, 2, ...).
     fn feature_values(&self) -> Vec<f64>;
-
-    /// Number of features.
-    fn num_features(&self) -> usize;
 }
 
 /// The core learner. Stores labeled training data and answers queries via KNN.
@@ -34,6 +35,14 @@ pub trait DataPoint {
 /// Designed for datasets up to ~100k points. Uses brute-force neighbor search
 /// which is efficient up to this scale. For larger datasets, consider
 /// data retention strategies (e.g., sliding window over recent events).
+///
+/// `query()` and `predict()` require `&mut self` because they trigger lazy
+/// training (metric learning + K selection) on first call. Use `query_k()` and
+/// `predict_k()` for immutable access with a manually specified K.
+///
+/// Training is amortized: the metric and K are only recomputed when the dataset
+/// has doubled in size since the last computation. Call `force_retrain()` to
+/// trigger recomputation manually.
 pub struct Renegade<P: DataPoint> {
     entries: Vec<Entry<P>>,
     optimal_k: Option<usize>,
@@ -44,6 +53,8 @@ pub struct Renegade<P: DataPoint> {
 
 struct Entry<P: DataPoint> {
     point: P,
+    /// Cached feature values to avoid repeated allocation during queries.
+    cached_values: Vec<f64>,
     output: f64,
 }
 
@@ -64,7 +75,17 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Add a labeled data point. Invalidates cached K and metric if the dataset
     /// has grown significantly since last computation.
     pub fn add(&mut self, point: P, output: f64) {
-        self.entries.push(Entry { point, output });
+        let cached_values = point.feature_values();
+        debug_assert_eq!(
+            cached_values.len(),
+            point.feature_distances(&point).len(),
+            "feature_values() and feature_distances() must return the same number of features"
+        );
+        self.entries.push(Entry {
+            point,
+            cached_values,
+            output,
+        });
         // Invalidate if dataset has doubled since last computation
         if self.computed_at > 0 && self.entries.len() >= self.computed_at * 2 {
             self.optimal_k = None;
@@ -82,13 +103,34 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.entries.is_empty()
     }
 
+    /// Remove entries that don't satisfy the predicate. Useful for expiring
+    /// stale data (e.g., sliding window over recent events).
+    /// Invalidates cached K and metric.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&P, f64) -> bool,
+    {
+        self.entries.retain(|e| f(&e.point, e.output));
+        self.optimal_k = None;
+        self.learned_metric = None;
+    }
+
+    /// Force recomputation of the metric and K on the next query.
+    pub fn force_retrain(&mut self) {
+        self.optimal_k = None;
+        self.learned_metric = None;
+    }
+
     /// Compute distance between two points using the learned metric if available,
     /// otherwise fall back to simple mean of per-feature distances.
-    fn distance(&self, a: &P, b: &P) -> f64 {
+    fn distance_from_values(&self, a_values: &[f64], b_values: &[f64], a: &P, b: &P) -> f64 {
         match &self.learned_metric {
-            Some(metric) => metric.distance(&a.feature_values(), &b.feature_values()),
+            Some(metric) => metric.distance(a_values, b_values),
             None => {
                 let feat_dists = a.feature_distances(b);
+                if feat_dists.is_empty() {
+                    return 0.0;
+                }
                 feat_dists.iter().sum::<f64>() / feat_dists.len() as f64
             }
         }
@@ -97,11 +139,20 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Find the k nearest neighbors to a query point.
     /// Returns neighbors sorted by distance (closest first).
     pub fn query_k(&self, query: &P, k: usize) -> Neighbors {
+        let query_values = query.feature_values();
         let mut distances: Vec<(usize, f64)> = self
             .entries
             .iter()
             .enumerate()
-            .map(|(i, entry)| (i, self.distance(query, &entry.point)))
+            .map(|(i, entry)| {
+                let dist = self.distance_from_values(
+                    &query_values,
+                    &entry.cached_values,
+                    query,
+                    &entry.point,
+                );
+                (i, dist)
+            })
             .collect();
 
         distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -126,14 +177,26 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.query_k(query, k)
     }
 
-    /// Predict output using automatically determined K and distance-trend extrapolation.
-    pub fn predict(&mut self, query: &P) -> ExtrapolatedPrediction {
+    /// Predict output using automatically determined K and weighted mean.
+    pub fn predict(&mut self, query: &P) -> f64 {
+        let neighbors = self.query(query);
+        neighbors.weighted_mean()
+    }
+
+    /// Predict output using distance-trend extrapolation (auto K).
+    pub fn predict_extrapolated(&mut self, query: &P) -> ExtrapolatedPrediction {
         let neighbors = self.query(query);
         neighbors.extrapolate()
     }
 
+    /// Predict output for a query point using specified k and weighted mean.
+    pub fn predict_k(&self, query: &P, k: usize) -> f64 {
+        let neighbors = self.query_k(query, k);
+        neighbors.weighted_mean()
+    }
+
     /// Predict output for a query point using specified k and distance-trend extrapolation.
-    pub fn predict_k(&self, query: &P, k: usize) -> ExtrapolatedPrediction {
+    pub fn predict_k_extrapolated(&self, query: &P, k: usize) -> ExtrapolatedPrediction {
         let neighbors = self.query_k(query, k);
         neighbors.extrapolate()
     }
@@ -159,7 +222,11 @@ impl<P: DataPoint + Clone> Renegade<P> {
             let k_with_metric = self.compute_optimal_k();
             let error_with_metric = self.loo_error(k_with_metric, is_classification);
 
-            // Only keep metric if it strictly improves LOO error
+            // Only keep metric if it strictly improves LOO error.
+            // Note: the metric is learned on all data including LOO test points,
+            // which introduces a small optimistic bias. Empirically this is negligible
+            // (per-fold vs full-data metric gives nearly identical results), but
+            // the comparison is conservative — we only keep the metric if it wins.
             if error_with_metric < error_no_metric {
                 self.optimal_k = Some(k_with_metric);
             } else {
@@ -189,7 +256,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             .entries
             .iter()
             .map(|e| TrainingPoint {
-                features: e.point.feature_values(),
+                features: e.cached_values.clone(),
                 output: e.output,
             })
             .collect();
@@ -223,15 +290,42 @@ impl<P: DataPoint + Clone> Renegade<P> {
         best_k
     }
 
-    /// Heuristic: if all output values are "small integers" (within epsilon of
-    /// an integer), treat as classification. Otherwise regression.
+    /// Detect whether this is a classification or regression problem.
+    /// Uses a heuristic: classification if all outputs are near-integers AND
+    /// there are few distinct values (≤ 20). This avoids misclassifying
+    /// integer-valued regression targets (counts, scores, prices).
     fn detect_classification(&self) -> bool {
-        self.entries
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        let all_integer = self
+            .entries
             .iter()
-            .all(|e| (e.output - e.output.round()).abs() < 1e-6)
+            .all(|e| (e.output - e.output.round()).abs() < 1e-6);
+
+        if !all_integer {
+            return false;
+        }
+
+        // Count distinct values — many distinct integers suggests regression
+        let mut distinct: Vec<f64> = Vec::new();
+        for e in &self.entries {
+            let val = e.output.round();
+            if !distinct.iter().any(|&v| (v - val).abs() < 1e-10) {
+                distinct.push(val);
+                if distinct.len() > 20 {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// Compute leave-one-out error for a given K.
+    /// Uses inverse-distance weighted mean for regression (matches `weighted_mean()`),
+    /// majority voting for classification (matches `class_votes()`).
     /// For large datasets, evaluates a deterministic subsample to keep training fast.
     fn loo_error(&self, k: usize, is_classification: bool) -> f64 {
         let n = self.entries.len();
@@ -247,7 +341,12 @@ impl<P: DataPoint + Clone> Renegade<P> {
             let mut distances: Vec<(usize, f64)> = (0..n)
                 .filter(|&j| j != i)
                 .map(|j| {
-                    let dist = self.distance(&self.entries[i].point, &self.entries[j].point);
+                    let dist = self.distance_from_values(
+                        &self.entries[i].cached_values,
+                        &self.entries[j].cached_values,
+                        &self.entries[i].point,
+                        &self.entries[j].point,
+                    );
                     (j, dist)
                 })
                 .collect();
@@ -270,6 +369,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
                     total_error += 1.0;
                 }
             } else {
+                // Inverse-distance weighted mean — matches Neighbors::weighted_mean()
                 let mut weight_sum = 0.0;
                 let mut value_sum = 0.0;
                 let mut exact_match = None;
