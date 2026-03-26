@@ -2,6 +2,8 @@ mod diagnostics;
 mod metric;
 mod neighbor;
 mod predict;
+/// Vantage-point tree for metric-space nearest neighbor search.
+pub mod vptree;
 
 pub use diagnostics::{
     FeatureDiagnostics, ModelDiagnostics, NeighborDetail, OutputStats, PredictionDiagnostics,
@@ -62,12 +64,17 @@ pub struct Renegade<P: DataPoint> {
     // --- Training state ---
     optimal_k: Option<usize>,
     learned_metric: Option<LearnedMetric>,
+    /// VP-tree index for fast queries on larger datasets.
+    vp_index: Option<vptree::VpTree>,
     /// Number of entries when optimal_k / metric were last computed.
     computed_at: usize,
 }
 
 /// Minimum number of data points before learning a metric.
 const MIN_POINTS_FOR_METRIC: usize = 10;
+
+/// Threshold above which we use VP-tree instead of brute force.
+const VP_TREE_THRESHOLD: usize = 1000;
 
 impl<P: DataPoint + Clone> Renegade<P> {
     /// Create a new empty learner.
@@ -79,6 +86,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             num_features: 0,
             optimal_k: None,
             learned_metric: None,
+            vp_index: None,
             computed_at: 0,
         }
     }
@@ -107,8 +115,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
 
         // Invalidate if dataset has doubled since last computation
         if self.computed_at > 0 && self.len() >= self.computed_at * 2 {
-            self.optimal_k = None;
-            self.learned_metric = None;
+            self.invalidate();
         }
     }
 
@@ -148,14 +155,19 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.points.truncate(write);
         self.outputs.truncate(write);
         self.values_flat.truncate(write * nf);
-        self.optimal_k = None;
-        self.learned_metric = None;
+        self.invalidate();
     }
 
     /// Force recomputation of the metric and K on the next query.
     pub fn force_retrain(&mut self) {
+        self.invalidate();
+    }
+
+    /// Clear all cached training state.
+    fn invalidate(&mut self) {
         self.optimal_k = None;
         self.learned_metric = None;
+        self.vp_index = None;
     }
 
     /// Get the cached feature values for entry i as a slice.
@@ -197,19 +209,28 @@ impl<P: DataPoint + Clone> Renegade<P> {
 
     /// Find the k nearest neighbors to a query point.
     /// Returns neighbors sorted by distance (closest first).
+    /// Uses VP-tree for fast search when available, otherwise brute force.
     pub fn query_k(&self, query: &P, k: usize) -> Neighbors {
         let query_values = query.feature_values();
-        let n = self.len();
-        let mut distances: Vec<(usize, f64)> = Vec::with_capacity(n);
-        for i in 0..n {
-            let dist = self.distance_to_entry(&query_values, query, i);
-            distances.push((i, dist));
-        }
 
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        distances.truncate(k);
+        let results = if let Some(ref vp) = self.vp_index {
+            // VP-tree path: O(log n) average
+            let query_dist = |i: usize| self.distance_to_entry(&query_values, query, i);
+            vp.query_nearest(k, &query_dist)
+        } else {
+            // Brute force path: O(n)
+            let n = self.len();
+            let mut distances: Vec<(usize, f64)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let dist = self.distance_to_entry(&query_values, query, i);
+                distances.push((i, dist));
+            }
+            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            distances.truncate(k);
+            distances
+        };
 
-        let neighbors = distances
+        let neighbors = results
             .into_iter()
             .map(|(i, dist)| Neighbor {
                 distance: dist,
@@ -284,6 +305,14 @@ impl<P: DataPoint + Clone> Renegade<P> {
             self.learned_metric = None;
             let k = self.compute_optimal_k();
             self.optimal_k = Some(k);
+        }
+
+        // Build VP-tree index for fast queries on larger datasets
+        if self.len() >= VP_TREE_THRESHOLD {
+            let n = self.len();
+            self.vp_index = Some(vptree::VpTree::build(n, &|a, b| {
+                self.distance_between(a, b)
+            }));
         }
 
         self.computed_at = self.len();
