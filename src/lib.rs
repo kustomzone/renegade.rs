@@ -48,18 +48,22 @@ pub trait DataPoint {
 /// has doubled in size since the last computation. Call `force_retrain()` to
 /// trigger recomputation manually.
 pub struct Renegade<P: DataPoint> {
-    entries: Vec<Entry<P>>,
+    // --- SoA layout for cache-friendly iteration ---
+    /// Original data points (cold path — only accessed for feature_distances fallback).
+    points: Vec<P>,
+    /// Flat contiguous array of all feature values: [p0_f0, p0_f1, ..., p1_f0, p1_f1, ...].
+    /// Length = num_entries * num_features. Indexed by `i * num_features + f`.
+    values_flat: Vec<f64>,
+    /// Output values, one per entry. Contiguous for cache-friendly access.
+    outputs: Vec<f64>,
+    /// Number of features per data point (0 until first point is added).
+    num_features: usize,
+
+    // --- Training state ---
     optimal_k: Option<usize>,
     learned_metric: Option<LearnedMetric>,
     /// Number of entries when optimal_k / metric were last computed.
     computed_at: usize,
-}
-
-struct Entry<P: DataPoint> {
-    point: P,
-    /// Cached feature values to avoid repeated allocation during queries.
-    cached_values: Vec<f64>,
-    output: f64,
 }
 
 /// Minimum number of data points before learning a metric.
@@ -69,7 +73,10 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Create a new empty learner.
     pub fn new() -> Self {
         Renegade {
-            entries: Vec::new(),
+            points: Vec::new(),
+            values_flat: Vec::new(),
+            outputs: Vec::new(),
+            num_features: 0,
             optimal_k: None,
             learned_metric: None,
             computed_at: 0,
@@ -79,32 +86,42 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Add a labeled data point. Invalidates cached K and metric if the dataset
     /// has grown significantly since last computation.
     pub fn add(&mut self, point: P, output: f64) {
-        let cached_values = point.feature_values();
-        debug_assert_eq!(
-            cached_values.len(),
-            point.feature_distances(&point).len(),
-            "feature_values() and feature_distances() must return the same number of features"
-        );
-        self.entries.push(Entry {
-            point,
-            cached_values,
-            output,
-        });
+        let values = point.feature_values();
+        if self.num_features == 0 {
+            self.num_features = values.len();
+            debug_assert_eq!(
+                values.len(),
+                point.feature_distances(&point).len(),
+                "feature_values() and feature_distances() must return the same number of features"
+            );
+        } else {
+            debug_assert_eq!(
+                values.len(),
+                self.num_features,
+                "All data points must have the same number of features"
+            );
+        }
+        self.values_flat.extend_from_slice(&values);
+        self.outputs.push(output);
+        self.points.push(point);
+
         // Invalidate if dataset has doubled since last computation
-        if self.computed_at > 0 && self.entries.len() >= self.computed_at * 2 {
+        if self.computed_at > 0 && self.len() >= self.computed_at * 2 {
             self.optimal_k = None;
             self.learned_metric = None;
         }
     }
 
     /// Number of training points.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.outputs.len()
     }
 
     /// Whether the learner has no training data.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.outputs.is_empty()
     }
 
     /// Remove entries that don't satisfy the predicate. Useful for expiring
@@ -114,7 +131,23 @@ impl<P: DataPoint + Clone> Renegade<P> {
     where
         F: FnMut(&P, f64) -> bool,
     {
-        self.entries.retain(|e| f(&e.point, e.output));
+        let n = self.len();
+        let nf = self.num_features;
+        let mut write = 0;
+        for read in 0..n {
+            if f(&self.points[read], self.outputs[read]) {
+                if write != read {
+                    self.points.swap(write, read);
+                    self.outputs.swap(write, read);
+                    self.values_flat
+                        .copy_within(read * nf..(read + 1) * nf, write * nf);
+                }
+                write += 1;
+            }
+        }
+        self.points.truncate(write);
+        self.outputs.truncate(write);
+        self.values_flat.truncate(write * nf);
         self.optimal_k = None;
         self.learned_metric = None;
     }
@@ -125,13 +158,35 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.learned_metric = None;
     }
 
-    /// Compute distance between two points using the learned metric if available,
-    /// otherwise fall back to simple mean of per-feature distances.
-    fn distance_from_values(&self, a_values: &[f64], b_values: &[f64], a: &P, b: &P) -> f64 {
+    /// Get the cached feature values for entry i as a slice.
+    #[inline]
+    fn entry_values(&self, i: usize) -> &[f64] {
+        let nf = self.num_features;
+        &self.values_flat[i * nf..(i + 1) * nf]
+    }
+
+    /// Compute distance between a query (given as values slice) and entry i.
+    #[inline]
+    fn distance_to_entry(&self, query_values: &[f64], query: &P, i: usize) -> f64 {
         match &self.learned_metric {
-            Some(metric) => metric.distance(a_values, b_values),
+            Some(metric) => metric.distance(query_values, self.entry_values(i)),
             None => {
-                let feat_dists = a.feature_distances(b);
+                let feat_dists = query.feature_distances(&self.points[i]);
+                if feat_dists.is_empty() {
+                    return 0.0;
+                }
+                feat_dists.iter().sum::<f64>() / feat_dists.len() as f64
+            }
+        }
+    }
+
+    /// Compute distance between entries i and j.
+    #[inline]
+    fn distance_between(&self, i: usize, j: usize) -> f64 {
+        match &self.learned_metric {
+            Some(metric) => metric.distance(self.entry_values(i), self.entry_values(j)),
+            None => {
+                let feat_dists = self.points[i].feature_distances(&self.points[j]);
                 if feat_dists.is_empty() {
                     return 0.0;
                 }
@@ -144,20 +199,12 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Returns neighbors sorted by distance (closest first).
     pub fn query_k(&self, query: &P, k: usize) -> Neighbors {
         let query_values = query.feature_values();
-        let mut distances: Vec<(usize, f64)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let dist = self.distance_from_values(
-                    &query_values,
-                    &entry.cached_values,
-                    query,
-                    &entry.point,
-                );
-                (i, dist)
-            })
-            .collect();
+        let n = self.len();
+        let mut distances: Vec<(usize, f64)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let dist = self.distance_to_entry(&query_values, query, i);
+            distances.push((i, dist));
+        }
 
         distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         distances.truncate(k);
@@ -166,7 +213,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             .into_iter()
             .map(|(i, dist)| Neighbor {
                 distance: dist,
-                output: self.entries[i].output,
+                output: self.outputs[i],
             })
             .collect();
 
@@ -213,7 +260,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             return;
         }
 
-        if self.entries.len() >= MIN_POINTS_FOR_METRIC {
+        if self.len() >= MIN_POINTS_FOR_METRIC {
             // Compute best K without metric
             self.learned_metric = None;
             let k_no_metric = self.compute_optimal_k();
@@ -227,10 +274,6 @@ impl<P: DataPoint + Clone> Renegade<P> {
             let error_with_metric = self.loo_error_for_k(k_with_metric, is_classification);
 
             // Only keep metric if it strictly improves LOO error.
-            // Note: the metric is learned on all data including LOO test points,
-            // which introduces a small optimistic bias. Empirically this is negligible
-            // (per-fold vs full-data metric gives nearly identical results), but
-            // the comparison is conservative — we only keep the metric if it wins.
             if error_with_metric < error_no_metric {
                 self.optimal_k = Some(k_with_metric);
             } else {
@@ -243,7 +286,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             self.optimal_k = Some(k);
         }
 
-        self.computed_at = self.entries.len();
+        self.computed_at = self.len();
     }
 
     /// Get the current optimal K, training if necessary.
@@ -256,12 +299,10 @@ impl<P: DataPoint + Clone> Renegade<P> {
     fn learn_metric(&self) -> LearnedMetric {
         use metric::TrainingPoint;
 
-        let points: Vec<TrainingPoint> = self
-            .entries
-            .iter()
-            .map(|e| TrainingPoint {
-                features: e.cached_values.clone(),
-                output: e.output,
+        let points: Vec<TrainingPoint> = (0..self.len())
+            .map(|i| TrainingPoint {
+                features: self.entry_values(i).to_vec(),
+                output: self.outputs[i],
             })
             .collect();
 
@@ -270,10 +311,9 @@ impl<P: DataPoint + Clone> Renegade<P> {
 
     /// Compute optimal K via leave-one-out cross-validation.
     /// Computes distances once per eval point, then evaluates all K values
-    /// from the sorted distance list. This is O(max_eval * n) instead of
-    /// O(max_eval * n * max_k).
+    /// from the sorted distance list.
     fn compute_optimal_k(&self) -> usize {
-        let n = self.entries.len();
+        let n = self.len();
         if n <= 2 {
             return n.max(1);
         }
@@ -283,44 +323,32 @@ impl<P: DataPoint + Clone> Renegade<P> {
 
         let is_classification = self.detect_classification();
 
-        // Cap LOO evaluation to keep training fast.
         let max_eval = 200.min(n);
         let step = if n > max_eval { n / max_eval } else { 1 };
 
-        // For each eval point, compute and sort distances once.
-        // Then evaluate all K values from the sorted list.
-        let mut errors_by_k = vec![0.0f64; max_k + 1]; // index 0 unused
+        let mut errors_by_k = vec![0.0f64; max_k + 1];
         let mut count = 0;
 
         for i in (0..n).step_by(step).take(max_eval) {
             let mut distances: Vec<(usize, f64)> = (0..n)
                 .filter(|&j| j != i)
-                .map(|j| {
-                    let dist = self.distance_from_values(
-                        &self.entries[i].cached_values,
-                        &self.entries[j].cached_values,
-                        &self.entries[i].point,
-                        &self.entries[j].point,
-                    );
-                    (j, dist)
-                })
+                .map(|j| (j, self.distance_between(i, j)))
                 .collect();
 
             distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Evaluate each K from 1..=max_k using the sorted distances
             if is_classification {
                 let mut counts: Vec<(f64, usize)> = Vec::new();
                 for k in 1..=max_k.min(distances.len()) {
                     let (j, _) = distances[k - 1];
-                    let val = self.entries[j].output;
+                    let val = self.outputs[j];
                     if let Some(entry) = counts.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
                         entry.1 += 1;
                     } else {
                         counts.push((val, 1));
                     }
                     let predicted = counts.iter().max_by_key(|(_, c)| *c).unwrap().0;
-                    if (predicted - self.entries[i].output).abs() > 0.5 {
+                    if (predicted - self.outputs[i]).abs() > 0.5 {
                         errors_by_k[k] += 1.0;
                     }
                 }
@@ -336,11 +364,11 @@ impl<P: DataPoint + Clone> Renegade<P> {
                     if !has_exact {
                         if dist == 0.0 {
                             has_exact = true;
-                            exact_val = self.entries[j].output;
+                            exact_val = self.outputs[j];
                         } else {
                             let w = 1.0 / dist;
                             weight_sum += w;
-                            value_sum += w * self.entries[j].output;
+                            value_sum += w * self.outputs[j];
                         }
                     }
 
@@ -352,7 +380,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
                         continue;
                     };
 
-                    let err = predicted - self.entries[i].output;
+                    let err = predicted - self.outputs[i];
                     errors_by_k[k] += err * err;
                 }
             }
@@ -363,11 +391,10 @@ impl<P: DataPoint + Clone> Renegade<P> {
             return 1;
         }
 
-        // Find the K with lowest average error
         let mut best_k = 1;
         let mut best_error = f64::MAX;
-        for k in 1..=max_k {
-            let error = errors_by_k[k] / count as f64;
+        for (k, &err) in errors_by_k.iter().enumerate().skip(1) {
+            let error = err / count as f64;
             if error < best_error {
                 best_error = error;
                 best_k = k;
@@ -378,27 +405,20 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     /// Detect whether this is a classification or regression problem.
-    /// Uses a heuristic: classification if all outputs are near-integers AND
-    /// there are few distinct values (≤ 20). This avoids misclassifying
-    /// integer-valued regression targets (counts, scores, prices).
     fn detect_classification(&self) -> bool {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             return false;
         }
 
-        let all_integer = self
-            .entries
-            .iter()
-            .all(|e| (e.output - e.output.round()).abs() < 1e-6);
+        let all_integer = self.outputs.iter().all(|&o| (o - o.round()).abs() < 1e-6);
 
         if !all_integer {
             return false;
         }
 
-        // Count distinct values — many distinct integers suggests regression
         let mut distinct: Vec<f64> = Vec::new();
-        for e in &self.entries {
-            let val = e.output.round();
+        for &o in &self.outputs {
+            let val = o.round();
             if !distinct.iter().any(|&v| (v - val).abs() < 1e-10) {
                 distinct.push(val);
                 if distinct.len() > 20 {
@@ -411,9 +431,8 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     /// Compute leave-one-out error for a given K.
-    /// Used by ensure_trained to compare metric vs no-metric.
     fn loo_error_for_k(&self, k: usize, is_classification: bool) -> f64 {
-        let n = self.entries.len();
+        let n = self.len();
         let max_eval = 200.min(n);
         let step = if n > max_eval { n / max_eval } else { 1 };
         let mut total_error = 0.0;
@@ -422,15 +441,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
         for i in (0..n).step_by(step).take(max_eval) {
             let mut distances: Vec<(usize, f64)> = (0..n)
                 .filter(|&j| j != i)
-                .map(|j| {
-                    let dist = self.distance_from_values(
-                        &self.entries[i].cached_values,
-                        &self.entries[j].cached_values,
-                        &self.entries[i].point,
-                        &self.entries[j].point,
-                    );
-                    (j, dist)
-                })
+                .map(|j| (j, self.distance_between(i, j)))
                 .collect();
 
             distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -439,7 +450,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             if is_classification {
                 let mut counts: Vec<(f64, usize)> = Vec::new();
                 for &(j, _) in &distances {
-                    let val = self.entries[j].output;
+                    let val = self.outputs[j];
                     if let Some(entry) = counts.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
                         entry.1 += 1;
                     } else {
@@ -447,7 +458,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
                     }
                 }
                 let predicted = counts.iter().max_by_key(|(_, count)| *count).unwrap().0;
-                if (predicted - self.entries[i].output).abs() > 0.5 {
+                if (predicted - self.outputs[i]).abs() > 0.5 {
                     total_error += 1.0;
                 }
             } else {
@@ -456,15 +467,15 @@ impl<P: DataPoint + Clone> Renegade<P> {
                 let mut exact_match = None;
                 for &(j, dist) in &distances {
                     if dist == 0.0 {
-                        exact_match = Some(self.entries[j].output);
+                        exact_match = Some(self.outputs[j]);
                         break;
                     }
                     let w = 1.0 / dist;
                     weight_sum += w;
-                    value_sum += w * self.entries[j].output;
+                    value_sum += w * self.outputs[j];
                 }
                 let predicted = exact_match.unwrap_or(value_sum / weight_sum);
-                let err = predicted - self.entries[i].output;
+                let err = predicted - self.outputs[i];
                 total_error += err * err;
             }
             count += 1;

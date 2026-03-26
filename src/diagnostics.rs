@@ -78,11 +78,11 @@ impl<P: DataPoint + Clone> Renegade<P> {
             .map(|metric| metric.feature_diagnostics());
 
         ModelDiagnostics {
-            num_entries: self.entries.len(),
+            num_entries: self.len(),
             optimal_k: self.optimal_k,
             metric_active: self.learned_metric.is_some(),
             trained_at: self.computed_at,
-            entries_since_training: self.entries.len().saturating_sub(self.computed_at),
+            entries_since_training: self.len().saturating_sub(self.computed_at),
             is_classification,
             feature_metrics,
             output_stats,
@@ -92,20 +92,12 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Get detailed diagnostics for a specific prediction.
     pub fn predict_with_diagnostics(&self, query: &P, k: usize) -> PredictionDiagnostics {
         let query_values = query.feature_values();
-        let mut distances: Vec<(usize, f64)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let dist = self.distance_from_values(
-                    &query_values,
-                    &entry.cached_values,
-                    query,
-                    &entry.point,
-                );
-                (i, dist)
-            })
-            .collect();
+        let n = self.len();
+        let mut distances: Vec<(usize, f64)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let dist = self.distance_to_entry(&query_values, query, i);
+            distances.push((i, dist));
+        }
 
         distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         distances.truncate(k);
@@ -114,13 +106,13 @@ impl<P: DataPoint + Clone> Renegade<P> {
             .iter()
             .map(|&(i, dist)| {
                 let feature_distances = if self.learned_metric.is_none() {
-                    Some(query.feature_distances(&self.entries[i].point))
+                    Some(query.feature_distances(&self.points[i]))
                 } else {
                     None
                 };
                 NeighborDetail {
                     distance: dist,
-                    output: self.entries[i].output,
+                    output: self.outputs[i],
                     feature_distances,
                 }
             })
@@ -153,7 +145,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     fn compute_output_stats(&self) -> OutputStats {
-        if self.entries.is_empty() {
+        if self.is_empty() {
             return OutputStats {
                 min: f64::NAN,
                 max: f64::NAN,
@@ -167,19 +159,19 @@ impl<P: DataPoint + Clone> Renegade<P> {
         let mut sum = 0.0;
         let mut distinct: Vec<f64> = Vec::new();
 
-        for e in &self.entries {
-            min = min.min(e.output);
-            max = max.max(e.output);
-            sum += e.output;
-            if !distinct.iter().any(|&v| (v - e.output).abs() < 1e-10) {
-                distinct.push(e.output);
+        for &o in &self.outputs {
+            min = min.min(o);
+            max = max.max(o);
+            sum += o;
+            if !distinct.iter().any(|&v| (v - o).abs() < 1e-10) {
+                distinct.push(o);
             }
         }
 
         OutputStats {
             min,
             max,
-            mean: sum / self.entries.len() as f64,
+            mean: sum / self.outputs.len() as f64,
             num_distinct: distinct.len(),
         }
     }

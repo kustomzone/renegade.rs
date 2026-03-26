@@ -71,7 +71,6 @@ fn profile_training_and_inference() {
         let data = make_dataset(n, d, 42);
         let query_point = data[0].0.clone();
 
-        // Measure training (ensure_trained via get_optimal_k)
         let mut model = Renegade::new();
         for (p, o) in &data {
             model.add(p.clone(), *o);
@@ -81,19 +80,19 @@ fn profile_training_and_inference() {
         model.get_optimal_k();
         let train_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        // Measure single query (inference)
+        // Warm up
+        let _ = model.query_k(&query_point, 5);
+
         let t0 = Instant::now();
         let _ = model.query_k(&query_point, 5);
         let query_us = t0.elapsed().as_secs_f64() * 1_000_000.0;
 
-        // Measure 100 queries
         let t0 = Instant::now();
         for i in 0..100 {
             let _ = model.query_k(&data[i % data.len()].0, 5);
         }
         let query_100_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        // Measure predict (includes weighted mean computation)
         let t0 = Instant::now();
         let _ = model.predict_k(&query_point, 5);
         let predict_us = t0.elapsed().as_secs_f64() * 1_000_000.0;
@@ -105,8 +104,8 @@ fn profile_training_and_inference() {
     }
     eprintln!();
 
-    // Profile the hot path: what takes time in a single query?
-    eprintln!("=== Query Hot Path Breakdown (n=5000, d=5) ===");
+    // Detailed query breakdown at n=5000, d=5
+    eprintln!("=== Query Breakdown (n=5000, d=5, avg of 100 iters) ===");
     let data = make_dataset(5000, 5, 42);
     let mut model = Renegade::new();
     for (p, o) in &data {
@@ -115,33 +114,101 @@ fn profile_training_and_inference() {
     model.get_optimal_k();
 
     let query = &data[0].0;
-    let query_values = query.feature_values();
+    let iters = 100;
 
-    let entries_count = data.len();
-    let t0 = Instant::now();
-    let mut dists = Vec::with_capacity(entries_count);
-    for (p, _) in &data {
-        let d = query.feature_distances(p);
-        let mean = d.iter().sum::<f64>() / d.len() as f64;
-        dists.push(mean);
+    // Warm up
+    for _ in 0..10 {
+        let _ = model.query_k(query, 5);
     }
-    let dist_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // Sort
+    // Full query_k
     let t0 = Instant::now();
-    let mut indexed: Vec<(usize, f64)> = dists.iter().enumerate().map(|(i, &d)| (i, d)).collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    let sort_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    // Vec allocation for feature_distances
-    let t0 = Instant::now();
-    for (p, _) in &data {
-        let _ = query.feature_distances(p);
+    for _ in 0..iters {
+        let _ = model.query_k(query, 5);
     }
-    let alloc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let query_k_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    eprintln!("  Distance computation (n=5000): {:.2} ms", dist_ms);
-    eprintln!("  Vec allocation overhead (n=5000): {:.2} ms", alloc_ms);
-    eprintln!("  Sort (n=5000): {:.2} ms", sort_ms);
+    // Just feature_values() on query (1 alloc)
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = query.feature_values();
+    }
+    let fv_query_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // feature_distances for all 5000 points (5000 allocs)
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        for (p, _) in &data {
+            let _ = query.feature_distances(p);
+        }
+    }
+    let fd_all_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // Raw distance computation without Vec allocation (inline arithmetic)
+    let qf = &query.features;
+    let ranges = &query.ranges;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let mut _total = 0.0f64;
+        for (p, _) in &data {
+            let mut sum = 0.0;
+            for k in 0..5 {
+                sum += (qf[k] - p.features[k]).abs() / (ranges[k].1 - ranges[k].0);
+            }
+            _total += sum / 5.0;
+        }
+    }
+    let raw_dist_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // Sort of 5000 (usize, f64) tuples
+    let dummy: Vec<(usize, f64)> = (0..5000).map(|i| (i, (i as f64 * 17.3) % 1.0)).collect();
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let mut d = dummy.clone();
+        d.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let sort_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    // Vec<(usize, f64)> collect from iterator
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _v: Vec<(usize, f64)> = (0..5000).map(|i| (i, i as f64 * 0.001)).collect();
+    }
+    let collect_ms = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+    eprintln!("  Full query_k:                    {:.3} ms", query_k_ms);
+    eprintln!("  feature_values() (1 call):       {:.3} ms", fv_query_ms);
+    eprintln!("  feature_distances() x5000:       {:.3} ms", fd_all_ms);
+    eprintln!("  Raw inline distance x5000:       {:.3} ms", raw_dist_ms);
+    eprintln!(
+        "  Vec alloc overhead (fd - raw):    {:.3} ms",
+        fd_all_ms - raw_dist_ms
+    );
+    eprintln!("  Sort 5000 tuples:                {:.3} ms", sort_ms);
+    eprintln!("  Collect 5000 tuples:             {:.3} ms", collect_ms);
+    eprintln!(
+        "  Unaccounted:                     {:.3} ms",
+        query_k_ms - fv_query_ms - fd_all_ms - sort_ms - collect_ms
+    );
+    eprintln!();
+
+    // Training breakdown
+    eprintln!("=== Training Breakdown (n=5000, d=5) ===");
+    let data = make_dataset(5000, 5, 42);
+    let mut model = Renegade::new();
+    for (p, o) in &data {
+        model.add(p.clone(), *o);
+    }
+    let t0 = Instant::now();
+    model.get_optimal_k();
+    let full_train_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    model.force_retrain();
+    let t0 = Instant::now();
+    model.get_optimal_k();
+    let retrain_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!("  First train:  {:.1} ms", full_train_ms);
+    eprintln!("  Retrain:      {:.1} ms", retrain_ms);
     eprintln!();
 }
