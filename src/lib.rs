@@ -73,8 +73,8 @@ pub struct Renegade<P: DataPoint> {
 /// Minimum number of data points before learning a metric.
 const MIN_POINTS_FOR_METRIC: usize = 10;
 
-/// Threshold above which we use VP-tree instead of brute force.
-const VP_TREE_THRESHOLD: usize = 1000;
+/// Minimum entries to build a VP-tree (below this, brute force is fine).
+const VP_TREE_THRESHOLD: usize = 3;
 
 impl<P: DataPoint + Clone> Renegade<P> {
     /// Create a new empty learner.
