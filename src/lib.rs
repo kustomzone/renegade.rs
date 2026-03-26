@@ -1,7 +1,11 @@
+mod diagnostics;
 mod metric;
 mod neighbor;
 mod predict;
 
+pub use diagnostics::{
+    FeatureDiagnostics, ModelDiagnostics, NeighborDetail, OutputStats, PredictionDiagnostics,
+};
 pub use metric::LearnedMetric;
 pub use neighbor::{Neighbor, Neighbors};
 pub use predict::ExtrapolatedPrediction;
@@ -214,13 +218,13 @@ impl<P: DataPoint + Clone> Renegade<P> {
             self.learned_metric = None;
             let k_no_metric = self.compute_optimal_k();
             let is_classification = self.detect_classification();
-            let error_no_metric = self.loo_error(k_no_metric, is_classification);
+            let error_no_metric = self.loo_error_for_k(k_no_metric, is_classification);
 
             // Learn metric and compute best K with it
             let candidate_metric = self.learn_metric();
             self.learned_metric = Some(candidate_metric);
             let k_with_metric = self.compute_optimal_k();
-            let error_with_metric = self.loo_error(k_with_metric, is_classification);
+            let error_with_metric = self.loo_error_for_k(k_with_metric, is_classification);
 
             // Only keep metric if it strictly improves LOO error.
             // Note: the metric is learned on all data including LOO test points,
@@ -265,6 +269,9 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     /// Compute optimal K via leave-one-out cross-validation.
+    /// Computes distances once per eval point, then evaluates all K values
+    /// from the sorted distance list. This is O(max_eval * n) instead of
+    /// O(max_eval * n * max_k).
     fn compute_optimal_k(&self) -> usize {
         let n = self.entries.len();
         if n <= 2 {
@@ -274,13 +281,93 @@ impl<P: DataPoint + Clone> Renegade<P> {
         let max_k = (n as f64).sqrt().ceil() as usize;
         let max_k = max_k.max(1).min(n - 1);
 
-        let mut best_k = 1;
-        let mut best_error = f64::MAX;
-
         let is_classification = self.detect_classification();
 
+        // Cap LOO evaluation to keep training fast.
+        let max_eval = 200.min(n);
+        let step = if n > max_eval { n / max_eval } else { 1 };
+
+        // For each eval point, compute and sort distances once.
+        // Then evaluate all K values from the sorted list.
+        let mut errors_by_k = vec![0.0f64; max_k + 1]; // index 0 unused
+        let mut count = 0;
+
+        for i in (0..n).step_by(step).take(max_eval) {
+            let mut distances: Vec<(usize, f64)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let dist = self.distance_from_values(
+                        &self.entries[i].cached_values,
+                        &self.entries[j].cached_values,
+                        &self.entries[i].point,
+                        &self.entries[j].point,
+                    );
+                    (j, dist)
+                })
+                .collect();
+
+            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Evaluate each K from 1..=max_k using the sorted distances
+            if is_classification {
+                let mut counts: Vec<(f64, usize)> = Vec::new();
+                for k in 1..=max_k.min(distances.len()) {
+                    let (j, _) = distances[k - 1];
+                    let val = self.entries[j].output;
+                    if let Some(entry) = counts.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
+                        entry.1 += 1;
+                    } else {
+                        counts.push((val, 1));
+                    }
+                    let predicted = counts.iter().max_by_key(|(_, c)| *c).unwrap().0;
+                    if (predicted - self.entries[i].output).abs() > 0.5 {
+                        errors_by_k[k] += 1.0;
+                    }
+                }
+            } else {
+                let mut weight_sum = 0.0;
+                let mut value_sum = 0.0;
+                let mut has_exact = false;
+                let mut exact_val = 0.0;
+
+                for k in 1..=max_k.min(distances.len()) {
+                    let (j, dist) = distances[k - 1];
+
+                    if !has_exact {
+                        if dist == 0.0 {
+                            has_exact = true;
+                            exact_val = self.entries[j].output;
+                        } else {
+                            let w = 1.0 / dist;
+                            weight_sum += w;
+                            value_sum += w * self.entries[j].output;
+                        }
+                    }
+
+                    let predicted = if has_exact {
+                        exact_val
+                    } else if weight_sum > 0.0 {
+                        value_sum / weight_sum
+                    } else {
+                        continue;
+                    };
+
+                    let err = predicted - self.entries[i].output;
+                    errors_by_k[k] += err * err;
+                }
+            }
+            count += 1;
+        }
+
+        if count == 0 {
+            return 1;
+        }
+
+        // Find the K with lowest average error
+        let mut best_k = 1;
+        let mut best_error = f64::MAX;
         for k in 1..=max_k {
-            let error = self.loo_error(k, is_classification);
+            let error = errors_by_k[k] / count as f64;
             if error < best_error {
                 best_error = error;
                 best_k = k;
@@ -324,17 +411,12 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     /// Compute leave-one-out error for a given K.
-    /// Uses inverse-distance weighted mean for regression (matches `weighted_mean()`),
-    /// majority voting for classification (matches `class_votes()`).
-    /// For large datasets, evaluates a deterministic subsample to keep training fast.
-    fn loo_error(&self, k: usize, is_classification: bool) -> f64 {
+    /// Used by ensure_trained to compare metric vs no-metric.
+    fn loo_error_for_k(&self, k: usize, is_classification: bool) -> f64 {
         let n = self.entries.len();
-        let mut total_error = 0.0;
-
-        // Cap LOO evaluation to keep training fast.
-        // Each eval point computes distance to all n points, so cost is max_eval * n.
         let max_eval = 200.min(n);
         let step = if n > max_eval { n / max_eval } else { 1 };
+        let mut total_error = 0.0;
         let mut count = 0;
 
         for i in (0..n).step_by(step).take(max_eval) {
@@ -369,7 +451,6 @@ impl<P: DataPoint + Clone> Renegade<P> {
                     total_error += 1.0;
                 }
             } else {
-                // Inverse-distance weighted mean — matches Neighbors::weighted_mean()
                 let mut weight_sum = 0.0;
                 let mut value_sum = 0.0;
                 let mut exact_match = None;

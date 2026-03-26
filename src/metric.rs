@@ -12,9 +12,9 @@ use pav_regression::{IsotonicRegression, Point as PavPoint};
 /// the isotonic regressions learn point-wise effects, not pair-wise distances.
 pub struct LearnedMetric {
     /// One isotonic regression per feature: maps raw feature value → effect on output.
-    effect_regressions: Vec<IsotonicRegression<f64>>,
+    pub(crate) effect_regressions: Vec<IsotonicRegression<f64>>,
     /// Weight per feature: proportion of output variance explained by this feature's effect.
-    weights: Vec<f64>,
+    pub(crate) weights: Vec<f64>,
 }
 
 /// Training data for metric learning: raw feature values and output.
