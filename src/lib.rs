@@ -58,6 +58,8 @@ pub struct Renegade<P: DataPoint> {
     values_flat: Vec<f64>,
     /// Output values, one per entry. Contiguous for cache-friendly access.
     outputs: Vec<f64>,
+    /// Instance weights, one per entry. Default 1.0.
+    instance_weights: Vec<f64>,
     /// Number of features per data point (0 until first point is added).
     num_features: usize,
 
@@ -85,6 +87,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             points: Vec::new(),
             values_flat: Vec::new(),
             outputs: Vec::new(),
+            instance_weights: Vec::new(),
             num_features: 0,
             optimal_k: None,
             learned_metric: None,
@@ -94,9 +97,16 @@ impl<P: DataPoint + Clone> Renegade<P> {
         }
     }
 
-    /// Add a labeled data point. Invalidates cached K and metric if the dataset
-    /// has grown significantly since last computation.
+    /// Add a labeled data point with default weight 1.0.
     pub fn add(&mut self, point: P, output: f64) {
+        self.add_weighted(point, output, 1.0);
+    }
+
+    /// Add a labeled data point with a specific instance weight.
+    /// Higher weight means this point has more influence on predictions.
+    /// Weight must be positive.
+    pub fn add_weighted(&mut self, point: P, output: f64, weight: f64) {
+        debug_assert!(weight > 0.0, "Instance weight must be positive");
         let values = point.feature_values();
         if self.num_features == 0 {
             self.num_features = values.len();
@@ -114,13 +124,13 @@ impl<P: DataPoint + Clone> Renegade<P> {
         }
         self.values_flat.extend_from_slice(&values);
         self.outputs.push(output);
+        self.instance_weights.push(weight);
         self.points.push(point);
 
         // Invalidate metric/K if dataset has grown 50% since last training
         if self.computed_at > 0 && self.len() >= self.computed_at + self.computed_at / 2 {
             self.optimal_k = None;
             self.learned_metric = None;
-            // VP-tree will be rebuilt during ensure_trained
             self.vp_index = None;
             self.vp_built_at = 0;
         }
@@ -161,6 +171,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
                 if write != read {
                     self.points.swap(write, read);
                     self.outputs.swap(write, read);
+                    self.instance_weights.swap(write, read);
                     self.values_flat
                         .copy_within(read * nf..(read + 1) * nf, write * nf);
                 }
@@ -169,6 +180,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
         }
         self.points.truncate(write);
         self.outputs.truncate(write);
+        self.instance_weights.truncate(write);
         self.values_flat.truncate(write * nf);
         self.invalidate();
     }
@@ -287,6 +299,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             .map(|(i, dist)| Neighbor {
                 distance: dist,
                 output: self.outputs[i],
+                weight: self.instance_weights[i],
             })
             .collect();
 
