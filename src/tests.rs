@@ -1,3 +1,4 @@
+use crate::neighbor::{Neighbor, Neighbors};
 use crate::{DataPoint, Renegade};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -266,4 +267,121 @@ fn auto_k_selection_works() {
         .unwrap()
         .0;
     assert_eq!(predicted, 0.0);
+}
+
+#[test]
+fn gaussian_weighted_mean_correctness() {
+    // Three neighbors at known distances with known outputs.
+    // h=1.0, so w(d) = exp(-d²/2).
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 0.1,
+                output: 10.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 0.5,
+                output: 20.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 2.0,
+                output: 30.0,
+                weight: 1.0,
+            },
+        ],
+    };
+    let h = 1.0;
+    let result = neighbors.gaussian_weighted_mean(h);
+
+    // Hand-compute: w0 = exp(-0.01/2) ≈ 0.99501, w1 = exp(-0.25/2) ≈ 0.88250, w2 = exp(-4/2) ≈ 0.13534
+    let w0 = (-0.01_f64 / 2.0).exp();
+    let w1 = (-0.25_f64 / 2.0).exp();
+    let w2 = (-4.0_f64 / 2.0).exp();
+    let expected = (w0 * 10.0 + w1 * 20.0 + w2 * 30.0) / (w0 + w1 + w2);
+
+    assert!(
+        (result - expected).abs() < 1e-10,
+        "Gaussian weighted mean: got {}, expected {}",
+        result,
+        expected
+    );
+
+    // Single neighbor: returns that neighbor's output
+    let single = Neighbors {
+        neighbors: vec![Neighbor {
+            distance: 0.5,
+            output: 42.0,
+            weight: 1.0,
+        }],
+    };
+    assert!((single.gaussian_weighted_mean(1.0) - 42.0).abs() < 1e-10);
+}
+
+#[test]
+fn gaussian_weighted_mean_tiny_bandwidth_falls_back() {
+    // Very small bandwidth: all weights underflow to 0, should fall back to nearest neighbor.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 0.1,
+                output: 99.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 0.5,
+                output: 50.0,
+                weight: 1.0,
+            },
+        ],
+    };
+    let result = neighbors.gaussian_weighted_mean(1e-100);
+    assert!(
+        (result - 99.0).abs() < 1e-10,
+        "Tiny bandwidth should fall back to nearest neighbor, got {}",
+        result
+    );
+}
+
+#[test]
+fn gaussian_weighted_mean_exact_match() {
+    // Distance 0 should be handled like weighted_mean: return exact match output.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 0.0,
+                output: 7.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 0.1,
+                output: 100.0,
+                weight: 1.0,
+            },
+        ],
+    };
+    assert!((neighbors.gaussian_weighted_mean(1.0) - 7.0).abs() < 1e-10);
+}
+
+#[test]
+fn classification_does_not_get_bandwidth() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+
+    // Two clusters with integer outputs = classification
+    for i in 0..50 {
+        model.add(Point2D::new(i as f64 * 0.1, 0.0, range, range), 0.0);
+    }
+    for i in 0..50 {
+        model.add(Point2D::new(5.0 + i as f64 * 0.1, 0.0, range, range), 1.0);
+    }
+
+    let _ = model.predict(&Point2D::new(0.5, 0.0, range, range));
+    let diag = model.diagnostics();
+    assert!(
+        diag.kernel_bandwidth.is_none(),
+        "Classification should not get Gaussian bandwidth, got {:?}",
+        diag.kernel_bandwidth
+    );
 }
