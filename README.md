@@ -29,8 +29,12 @@ Renegade wins **5 of 6** standard ML datasets with zero configuration. sklearn r
 
 ## Quick Start
 
+```bash
+cargo add renegade-ml
+```
+
 ```rust
-use renegade::{DataPoint, Renegade};
+use renegade_ml::{DataPoint, Renegade};
 
 #[derive(Clone)]
 struct Peer {
